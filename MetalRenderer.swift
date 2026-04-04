@@ -168,7 +168,9 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         metalView.depthStencilPixelFormat = .depth32Float
         metalView.clearDepth = 1.0
 
-        initWorld()
+        if !loadWorld() {
+            initWorld()
+        }
         setupPipeline()
         setupCrosshairPipeline()
         setupOutlinePipeline()
@@ -179,7 +181,7 @@ class MetalRenderer: NSObject, MTKViewDelegate {
 
         print("[SWIFT] MetalRenderer initialized - \(worldBlocks.count) blocks")
         print("[SWIFT] CONTROLS: WASD=move, Mouse=look, LClick=break, RClick=place")
-        print("[SWIFT] 1=Dirt, 2=Stone, Space=jump, Esc=release mouse")
+        print("[SWIFT] 1=Dirt, 2=Stone, Space=jump, Esc=release mouse, Cmd+S=save")
     }
 
     deinit {
@@ -294,12 +296,18 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             hit.blockPos.y + hit.faceNormal.y,
             hit.blockPos.z + hit.faceNormal.z
         )
-        let px = Int(floor(playerPos.x + 0.5))
-        let py1 = Int(floor(playerPos.y - eyeHeight + 0.5))
-        let py2 = Int(floor(playerPos.y + 0.5))
-        let pz = Int(floor(playerPos.z + 0.5))
-        if p.x == px && p.z == pz && (p.y == py1 || p.y == py2) { return }
         if worldBlocks[p] != nil { return }
+        // Check if the new block would overlap the player's AABB
+        let hw = playerWidth * 0.5
+        let feetY = playerPos.y - eyeHeight
+        let blockMin = SIMD3<Float>(Float(p.x) - 0.5, Float(p.y) - 0.5, Float(p.z) - 0.5)
+        let blockMax = SIMD3<Float>(Float(p.x) + 0.5, Float(p.y) + 0.5, Float(p.z) + 0.5)
+        let playerMin = SIMD3<Float>(playerPos.x - hw, feetY, playerPos.z - hw)
+        let playerMax = SIMD3<Float>(playerPos.x + hw, feetY + playerHeight, playerPos.z + hw)
+        // AABB overlap test
+        if blockMax.x > playerMin.x && blockMin.x < playerMax.x &&
+           blockMax.y > playerMin.y && blockMin.y < playerMax.y &&
+           blockMax.z > playerMin.z && blockMin.z < playerMax.z { return }
         worldBlocks[p] = currentBlock
         worldDirty = true
     }
@@ -326,16 +334,21 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             guard let self = self else { return event }
             self.keysPressed.insert(event.keyCode)
             if event.keyCode == 53 && self.mouseCaptured { self.releaseMouse() }
+            // Cmd+S to save
+            if event.modifierFlags.contains(.command) && event.characters == "s" {
+                self.saveWorld()
+                return nil
+            }
             switch event.characters {
             case "1": self.currentBlock = .dirt
             case "2": self.currentBlock = .stone
             default: break
             }
-            return event
+            return nil  // consume event to prevent macOS alert sound
         }
 
         keyUpMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyUp) { [weak self] event in
-            self?.keysPressed.remove(event.keyCode); return event
+            self?.keysPressed.remove(event.keyCode); return nil
         }
 
         mouseMovedMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .leftMouseDragged, .rightMouseDragged]) { [weak self] event in
@@ -598,9 +611,12 @@ class MetalRenderer: NSObject, MTKViewDelegate {
             lastFPSTime = now
             let blockName = currentBlock == .dirt ? "Dirt" : "Stone"
             let total = worldBlocks.count
+            let px = String(format: "%.1f", playerPos.x)
+            let py = String(format: "%.1f", playerPos.y - eyeHeight)  // show feet Y
+            let pz = String(format: "%.1f", playerPos.z)
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
-                self.window?.title = "Minecraft | \(blockName) | \(self.currentFPS) FPS | \(total) blocks"
+                self.window?.title = "Minecraft | \(blockName) | \(self.currentFPS) FPS | \(total) blocks | XYZ: \(px) \(py) \(pz)"
             }
         }
     }
@@ -702,6 +718,69 @@ class MetalRenderer: NSObject, MTKViewDelegate {
         if frameCount == 1 {
             print("[SWIFT] First frame rendered!")
             fflush(stdout)
+        }
+    }
+
+    // MARK: - Save / Load (.SMCW format)
+
+    private static let saveFilePath: String = {
+        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".minecraft_swift").path
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        return dir + "/world.smcw"
+    }()
+
+    func saveWorld() {
+        // Format: first line is player pos/rotation, then one line per block: type,x,y,z
+        var lines: [String] = []
+        lines.append("SMCW1")  // version header
+        lines.append("player,\(playerPos.x),\(playerPos.y),\(playerPos.z),\(playerYaw),\(playerPitch)")
+        for (pos, blockType) in worldBlocks {
+            lines.append("\(blockType.rawValue),\(pos.x),\(pos.y),\(pos.z)")
+        }
+        let data = lines.joined(separator: "\n")
+        do {
+            try data.write(toFile: MetalRenderer.saveFilePath, atomically: true, encoding: .utf8)
+            print("[SWIFT] World saved: \(worldBlocks.count) blocks → \(MetalRenderer.saveFilePath)")
+        } catch {
+            print("[SWIFT] ERROR saving world: \(error)")
+        }
+    }
+
+    func loadWorld() -> Bool {
+        guard FileManager.default.fileExists(atPath: MetalRenderer.saveFilePath) else { return false }
+        do {
+            let data = try String(contentsOfFile: MetalRenderer.saveFilePath, encoding: .utf8)
+            let lines = data.components(separatedBy: "\n")
+            guard lines.first == "SMCW1" else {
+                print("[SWIFT] Invalid save file format")
+                return false
+            }
+            var newBlocks: [BlockPos: BlockType] = [:]
+            for line in lines.dropFirst() {
+                let parts = line.components(separatedBy: ",")
+                if parts.count == 6 && parts[0] == "player" {
+                    if let px = Float(parts[1]), let py = Float(parts[2]), let pz = Float(parts[3]),
+                       let yaw = Float(parts[4]), let pitch = Float(parts[5]) {
+                        playerPos = SIMD3<Float>(px, py, pz)
+                        playerYaw = yaw
+                        playerPitch = pitch
+                    }
+                } else if parts.count == 4 {
+                    if let typeRaw = Int(parts[0]), let bx = Int(parts[1]),
+                       let by = Int(parts[2]), let bz = Int(parts[3]),
+                       let blockType = BlockType(rawValue: typeRaw) {
+                        newBlocks[BlockPos(bx, by, bz)] = blockType
+                    }
+                }
+            }
+            worldBlocks = newBlocks
+            worldDirty = true
+            velocityY = 0
+            print("[SWIFT] World loaded: \(worldBlocks.count) blocks from \(MetalRenderer.saveFilePath)")
+            return true
+        } catch {
+            print("[SWIFT] ERROR loading world: \(error)")
+            return false
         }
     }
 }
