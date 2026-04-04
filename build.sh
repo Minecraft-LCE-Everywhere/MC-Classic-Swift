@@ -5,7 +5,7 @@ set -e
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$PROJECT_DIR/build"
 
-echo "Building Swift Metal test app..."
+echo "Building Minecraft..."
 
 # Clean build directory
 rm -rf "$BUILD_DIR"
@@ -26,7 +26,7 @@ SWIFT_FILES=(
 
 swiftc \
     -target arm64-apple-macosx14.0 \
-    -o "$BUILD_DIR/SwiftMetalTest" \
+    -o "$BUILD_DIR/Minecraft" \
     "${SWIFT_FILES[@]}" \
     -framework Foundation \
     -framework AppKit \
@@ -37,7 +37,7 @@ swiftc \
 echo "Build successful!"
 echo "Running app..."
 
-"$BUILD_DIR/SwiftMetalTest" &
+"$BUILD_DIR/Minecraft" &
 APP_PID=$!
 
 echo "App launched with PID: $APP_PID"
